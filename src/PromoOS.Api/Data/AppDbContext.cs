@@ -20,7 +20,10 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
             entity.Property(t => t.Priority)
                 .HasConversion<string>();
 
+            // TODO: always NULL on PostgreSQL. Would drop this column in a new migration.
             entity.Property(t => t.RowVersion).IsRowVersion();
+            
+            entity.Property(t => t.IsCompleted).IsConcurrencyToken();
         });
     }
 }

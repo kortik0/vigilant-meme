@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Text;
 using System.Text.Json;
 using Microsoft.Extensions.Options;
@@ -28,6 +29,9 @@ public class RabbitMqPublisher : IRabbitMqPublisher, IHostedService
     private IConnection? _connection;
     private IChannel? _channel;
 
+    private readonly SemaphoreSlim _publishLock = new(1, 1);
+    private readonly ConcurrentDictionary<Guid, Task> _inFlight = new();
+
     public RabbitMqPublisher(IOptions<RabbitMqOptions> options, ILogger<RabbitMqPublisher> logger)
     {
         _options = options.Value;
@@ -56,46 +60,58 @@ public class RabbitMqPublisher : IRabbitMqPublisher, IHostedService
                 autoDelete: false,
                 cancellationToken: cancellationToken);
 
-            _logger.LogInformation("RabbitMq is started, {name} ready", ExchangeName);
+            _logger.LogInformation("Rabbit connected, exchange {name}", ExchangeName);
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "RabbitMQ unavailable on start. Messages will be dropped silently.");
+            _logger.LogWarning(ex, "Can't reach RabbitMQ on start, events won't be send");
         }
     }
 
     public void PublishTaskCompleted(TaskCompletedMessage message)
     {
-        _ = Task.Run(async () =>
+        var id = Guid.NewGuid();
+        var task = PublishAsync(message, id);
+        _inFlight[id] = task;
+    }
+
+    private async Task PublishAsync(TaskCompletedMessage message, Guid id)
+    {
+        await Task.Yield();
+        await _publishLock.WaitAsync();
+
+        try
         {
-            try
+            if (_channel is null)
             {
-                if (_channel is null)
-                {
-                    _logger.LogWarning("RabbitMQ channel not available. Dropping message for {TaskId}.",
-                        message.TaskId);
-                    return;
-                }
-
-                ReadOnlyMemory<byte> body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, _jsonOptions));
-
-                await _channel.BasicPublishAsync(
-                    exchange: ExchangeName,
-                    routingKey: RoutingKey,
-                    body: body);
-
-                _logger.LogInformation("Published task.completed for task {TaskId}.", message.TaskId);
+                _logger.LogWarning("No rabbit channel, skipping event for {TaskId}", message.TaskId);
+                return;
             }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Failed to publish task.completed for task {TaskId}.",
-                    message.TaskId);
-            }
-        });
+
+            var body = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(message, _jsonOptions));
+            await _channel.BasicPublishAsync(ExchangeName, RoutingKey, body);
+
+            _logger.LogInformation("task.completed sent for {TaskId}", message.TaskId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Couldnt send task.completed for {TaskId}", message.TaskId);
+        }
+        finally
+        {
+            _publishLock.Release();
+            _inFlight.TryRemove(id, out _);
+        }
     }
 
     public async Task StopAsync(CancellationToken cancellationToken)
     {
+        var pending = Task.WhenAll(_inFlight.Values);
+        if (await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(5))) != pending)
+        {
+            _logger.LogWarning("Some RabbitMQ publishes did not finish within 5s and may be lost.");
+        }
+
         using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
 
         try
@@ -112,11 +128,11 @@ public class RabbitMqPublisher : IRabbitMqPublisher, IHostedService
                 await _connection.DisposeAsync();
             }
 
-            _logger.LogInformation("RabbitMQ connection closed gracefully.");
+            _logger.LogInformation("Rabbit connection closed");
         }
         catch (Exception ex)
         {
-            _logger.LogWarning(ex, "RabbitMQ did not shut down cleanly within the timeout.");
+            _logger.LogWarning(ex, "Rabbit didn't close in time, moving on");
         }
     }
 }

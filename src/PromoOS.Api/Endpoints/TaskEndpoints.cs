@@ -33,6 +33,11 @@ public static class TaskEndpoints
             return Results.BadRequest(new { error = "Title too long." });
         }
 
+        if (!Enum.IsDefined(request.Priority))
+        {
+            return Results.BadRequest(new { error = "Priority must be Low, Medium or High." });
+        }
+
         var task = new TaskItem
         {
             Id = Guid.NewGuid(),
